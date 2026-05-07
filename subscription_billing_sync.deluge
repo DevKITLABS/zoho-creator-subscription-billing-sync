@@ -1,0 +1,180 @@
+subscriptionId = input.Subscription_ID;
+
+subscriptionData = Subscriptions[ID == subscriptionId];
+
+if(subscriptionData.count() == 0)
+{
+	info "Subscription not found";
+	return;
+}
+
+customerName = ifnull(subscriptionData.Customer_Name,"");
+customerEmail = ifnull(subscriptionData.Email,"");
+planName = ifnull(subscriptionData.Plan_Name,"");
+renewalDate = subscriptionData.Renewal_Date;
+subscriptionAmount = ifnull(subscriptionData.Amount,0);
+paymentStatus = ifnull(subscriptionData.Payment_Status,"Pending");
+booksInvoiceId = "";
+retryCount = ifnull(subscriptionData.Payment_Retry_Count,0);
+syncErrors = List();
+syncLogs = List();
+
+
+// Expiry validation
+
+daysLeft = zoho.currentdate.daysBetween(renewalDate);
+
+if(daysLeft <= 7)
+{
+	subscriptionData.Renewal_Reminder_Status = "Due";
+}
+
+
+// Create renewal invoice in Zoho Books
+
+invoicePayload = Map();
+invoicePayload.put("customer_name",customerName);
+invoicePayload.put("amount",subscriptionAmount);
+invoicePayload.put("description","Subscription Renewal - " + planName);
+
+invoiceResponse = invokeurl
+[
+	url :"https://www.zohoapis.in/books/v3/invoices?organization_id=60000000000"
+	type :POST
+	parameters:invoicePayload.toString()
+	connection:"zohobooks"
+];
+
+if(invoiceResponse.get("code") == 0)
+{
+	booksInvoiceId = invoiceResponse.get("invoice").get("invoice_id");
+	syncLogs.add("Renewal invoice created");
+}
+else
+{
+	syncErrors.add("Invoice generation failed");
+}
+
+
+// Payment gateway verification
+
+paymentPayload = Map();
+paymentPayload.put("customer_email",customerEmail);
+paymentPayload.put("amount",subscriptionAmount);
+
+paymentResponse = invokeurl
+[
+	url :"https://payments.example.com/api/check-payment"
+	type :POST
+	parameters:paymentPayload
+	headers:{"Authorization":"Bearer payment_token"}
+];
+
+if(paymentResponse.get("payment_status") == "success")
+{
+	paymentStatus = "Paid";
+	syncLogs.add("Payment verified");
+}
+else
+{
+	paymentStatus = "Failed";
+	syncErrors.add("Payment failed");
+}
+
+
+// Retry handling
+
+if(paymentStatus == "Failed")
+{
+	retryCount = retryCount + 1;
+	subscriptionData.Payment_Retry_Count = retryCount;
+
+	insert into Payment_Retry_Logs
+	[
+		Subscription = subscriptionId
+		Retry_Attempt = retryCount
+		Status = "Pending"
+	]
+
+	if(retryCount >= 3)
+	{
+		subscriptionData.Subscription_Status = "Grace Period";
+	}
+}
+
+
+// Subscription activation
+
+if(paymentStatus == "Paid")
+{
+	subscriptionData.Subscription_Status = "Active";
+	subscriptionData.Last_Payment_Date = zoho.currentdate;
+	subscriptionData.Next_Billing_Date = renewalDate.addMonth(1);
+}
+
+
+// Downgrade logic
+
+if(subscriptionAmount < 1000)
+{
+	subscriptionData.Customer_Tier = "Basic";
+}
+else if(subscriptionAmount < 10000)
+{
+	subscriptionData.Customer_Tier = "Premium";
+}
+else
+{
+	subscriptionData.Customer_Tier = "Enterprise";
+}
+
+
+// Revenue analytics log
+
+insert into Revenue_Analytics
+[
+	Customer_Name = customerName
+	Plan_Name = planName
+	Revenue_Amount = subscriptionAmount
+	Payment_Status = paymentStatus
+]
+
+
+// Sync audit logs
+
+insert into Billing_Sync_Audit
+[
+	Subscription = subscriptionId
+	Invoice_ID = booksInvoiceId
+	Sync_Logs = syncLogs.toString()
+	Error_Logs = syncErrors.toString()
+]
+
+
+// Finance alert
+
+if(subscriptionAmount >= 50000)
+{
+	sendmail
+	[
+		from : zoho.adminuserid
+		to : "finance@company.com"
+		subject : "High Value Subscription Renewal"
+		message : "Subscription renewed for customer " + customerName
+	]
+}
+
+
+// Final remarks
+
+if(syncErrors.isEmpty())
+{
+	subscriptionData.Sync_Status = "Success";
+}
+else
+{
+	subscriptionData.Sync_Status = "Failed";
+	subscriptionData.Sync_Remarks = syncErrors.toString();
+}
+
+info "Subscription Billing Sync Executed";
